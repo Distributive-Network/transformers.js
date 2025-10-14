@@ -40,7 +40,7 @@
 
 import {
     AutoConfig,
-    getKeyValueShapes,
+    getCacheShapes,
 } from './configs.js';
 
 import {
@@ -48,6 +48,7 @@ import {
     createInferenceSession,
     isONNXTensor,
     isONNXProxy,
+    runInferenceSession,
 } from './backends/onnx.js';
 import {
     DATA_TYPES,
@@ -88,8 +89,6 @@ import {
     MinNewTokensLengthLogitsProcessor,
 
     TemperatureLogitsWarper,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
     ClassifierFreeGuidanceLogitsProcessor,
 } from './generation/logits_process.js';
 
@@ -116,7 +115,7 @@ import { RawImage } from './utils/image.js';
 import { dynamic_time_warping, max, medianFilter } from './utils/maths.js';
 import { EosTokenCriteria, MaxLengthCriteria, StoppingCriteriaList } from './generation/stopping_criteria.js';
 import { LogitsSampler } from './generation/logits_sampler.js';
-import { apis } from './env.js';
+import { apis, env } from './env.js';
 
 import { WhisperGenerationConfig } from './models/whisper/generation_whisper.js';
 import { whisper_language_to_code } from './models/whisper/common_whisper.js';
@@ -136,6 +135,7 @@ const MODEL_TYPES = {
     Phi3V: 9,
     AudioTextToText: 10,
     AutoEncoder: 11,
+    ImageAudioTextToText: 12,
 }
 //////////////////////////////////////////////////
 
@@ -158,7 +158,8 @@ const MODEL_CLASS_TO_NAME_MAPPING = new Map();
  * @private
  */
 async function getSession(pretrained_model_name_or_path, fileName, options) {
-    const custom_config = options.config?.['transformers.js_config'] ?? {};
+    let custom_config = options.config?.['transformers.js_config'] ?? {};
+
     let device = options.device ?? custom_config.device;
     if (device && typeof device !== 'string') {
         if (device.hasOwnProperty(fileName)) {
@@ -173,7 +174,17 @@ async function getSession(pretrained_model_name_or_path, fileName, options) {
     const selectedDevice = /** @type {import("./utils/devices.js").DeviceType} */(
         device ?? (apis.IS_NODE_ENV ? 'cpu' : 'wasm')
     );
+
     const executionProviders = deviceToExecutionProviders(selectedDevice);
+
+    // Update custom config with the selected device's config, if it exists
+    const device_config = custom_config.device_config ?? {};
+    if (device_config.hasOwnProperty(selectedDevice)) {
+        custom_config = {
+            ...custom_config,
+            ...device_config[selectedDevice],
+        };
+    }
 
     // If options.dtype is specified, we use it to choose the suffix for the model file.
     // Otherwise, we use the default dtype for the device.
@@ -191,11 +202,11 @@ async function getSession(pretrained_model_name_or_path, fileName, options) {
         // Try to choose the auto dtype based on the custom config
         let config_dtype = custom_config.dtype;
         if (typeof config_dtype !== 'string') {
-            config_dtype = config_dtype[fileName];
+            config_dtype = config_dtype?.[fileName];
         }
 
         if (config_dtype && config_dtype !== DATA_TYPES.auto && DATA_TYPES.hasOwnProperty(config_dtype)) {
-            // Defined by the custom config, and is not "auto"
+            // Defined by the config, and is not "auto"
             dtype = config_dtype;
         } else {
             // Choose default dtype based on device, falling back to fp32
@@ -212,10 +223,11 @@ async function getSession(pretrained_model_name_or_path, fileName, options) {
     }
 
     // Only valid for models with a decoder
-    const kv_cache_dtype = custom_config.kv_cache_dtype
-        ? (typeof custom_config.kv_cache_dtype === 'string'
-            ? custom_config.kv_cache_dtype
-            : custom_config.kv_cache_dtype[selectedDtype] ?? 'float32')
+    const kv_cache_dtype_config = custom_config.kv_cache_dtype;
+    const kv_cache_dtype = kv_cache_dtype_config
+        ? (typeof kv_cache_dtype_config === 'string'
+            ? kv_cache_dtype_config
+            : kv_cache_dtype_config[selectedDtype] ?? 'float32')
         : undefined;
 
     if (kv_cache_dtype && !['float32', 'float16'].includes(kv_cache_dtype)) {
@@ -225,6 +237,7 @@ async function getSession(pretrained_model_name_or_path, fileName, options) {
     const session_config = {
         dtype: selectedDtype,
         kv_cache_dtype,
+        device: selectedDevice,
     }
 
     // Construct the model file name
@@ -243,14 +256,15 @@ async function getSession(pretrained_model_name_or_path, fileName, options) {
         session_options.freeDimensionOverrides ??= free_dimension_overrides;
     } else if (selectedDevice.startsWith('webnn') && !session_options.freeDimensionOverrides) {
         console.warn(
-            'WebNN does not currently support dynamic shapes and requires `free_dimension_overrides` to be set in config.json as a field within "transformers.js_config". ' +
-            'When `free_dimension_overrides` is not set, you may experience significant performance degradation.'
+            `WebNN does not currently support dynamic shapes and requires 'free_dimension_overrides' to be set in config.json, preferably as a field within config["transformers.js_config"]["device_config"]["${selectedDevice}"]. ` +
+            `When 'free_dimension_overrides' is not set, you may experience significant performance degradation.`
         );
     }
 
-    const bufferOrPathPromise = getModelFile(pretrained_model_name_or_path, modelFileName, true, options, apis.IS_NODE_ENV);
+    const return_path = apis.IS_NODE_ENV && env.useFSCache;
+    const bufferOrPathPromise = getModelFile(pretrained_model_name_or_path, modelFileName, true, options, return_path);
 
-    // handle onnx external data files
+    // Handle onnx external data files
     const use_external_data_format = options.use_external_data_format ?? custom_config.use_external_data_format;
     /** @type {Promise<string|{path: string, data: Uint8Array}>[]} */
     let externalDataPromises = [];
@@ -276,7 +290,7 @@ async function getSession(pretrained_model_name_or_path, fileName, options) {
             const path = `${baseName}_data${i === 0 ? '' : '_' + i}`;
             const fullPath = `${options.subfolder ?? ''}/${path}`;
             externalDataPromises.push(new Promise(async (resolve, reject) => {
-                const data = await getModelFile(pretrained_model_name_or_path, fullPath, true, options, apis.IS_NODE_ENV);
+                const data = await getModelFile(pretrained_model_name_or_path, fullPath, true, options, return_path);
                 resolve(data instanceof Uint8Array ? { path, data } : path);
             }));
         }
@@ -303,7 +317,7 @@ async function getSession(pretrained_model_name_or_path, fileName, options) {
     }
 
     if (selectedDevice === 'webgpu') {
-        const shapes = getKeyValueShapes(options.config, {
+        const shapes = getCacheShapes(options.config, {
             prefix: 'present',
         });
         if (Object.keys(shapes).length > 0 && !isONNXProxy()) {
@@ -420,17 +434,25 @@ async function sessionRun(session, inputs) {
     try {
         // pass the original ort tensor
         const ortFeed = Object.fromEntries(Object.entries(checkedInputs).map(([k, v]) => [k, v.ort_tensor]));
-        let output = await session.run(ortFeed);
-        output = replaceTensors(output);
-        return output;
+        const output = await runInferenceSession(session, ortFeed);
+        return replaceTensors(output);
     } catch (e) {
         // Error messages can be long (nested) and uninformative. For this reason,
         // we apply minor formatting to show the most important information
         const formatted = Object.fromEntries(Object.entries(checkedInputs)
-            .map(([k, { type, dims, data }]) => [k, {
+            .map(([k, tensor]) => {
                 // Extract these properties from the underlying ORT tensor
-                type, dims, data,
-            }]));
+                const unpacked = {
+                    type: tensor.type,
+                    dims: tensor.dims,
+                    location: tensor.location,
+                }
+                if (unpacked.location !== "gpu-buffer") {
+                    // Only return the data if it's not a GPU buffer
+                    unpacked.data = tensor.data;
+                }
+                return [k, unpacked];
+            }));
 
         // This usually occurs when the inputs are of the wrong type.
         console.error(`An error occurred during model execution: "${e}".`);
@@ -858,8 +880,26 @@ function createPositionIds(model_inputs, past_key_values = null, start_index = 0
 }
 
 function decoder_prepare_inputs_for_generation(self, input_ids, model_inputs, generation_config) {
+    const past_length = model_inputs.past_key_values
+        ? Object.values(model_inputs.past_key_values)[0].dims.at(-2)
+        : 0;
+
+    if (!model_inputs.attention_mask) {
+        // If the attention mask is not provided, we attempt to infer based on provided inputs
+        let dims;
+        for (const key of ['input_ids', 'inputs_embeds', 'position_ids']) {
+            if (model_inputs[key]) {
+                dims = model_inputs[key].dims;
+                break;
+            }
+        }
+        if (!dims) {
+            throw new Error("attention_mask is not provided, and unable to infer its shape from model inputs.");
+        }
+        model_inputs.attention_mask = ones([dims[0], past_length + dims[1]]);
+    }
+
     if (model_inputs.past_key_values) {
-        const past_length = Object.values(model_inputs.past_key_values)[0].dims.at(-2);
         const { input_ids, attention_mask } = model_inputs;
 
         // Keep only the unprocessed tokens:
@@ -880,24 +920,7 @@ function decoder_prepare_inputs_for_generation(self, input_ids, model_inputs, ge
         }
         // 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
         else {
-            if (
-                // NOTE: Only used by VLMs (!= so that null matches undefined)
-                self.config.image_token_index != null &&
-                // Equivalent to `self.config.image_token_index in input_ids` (== so that int matches bigint)
-                input_ids.data.some(x => x == self.config.image_token_index)
-            ) {
-                // TODO: Support multiple image tokens
-                const num_image_tokens = self.config.num_image_tokens;
-                if (!num_image_tokens) {
-                    throw new Error('`num_image_tokens` is missing in the model configuration.');
-                }
 
-                const num_new_tokens = input_ids.dims[1] - (past_length - num_image_tokens);
-                model_inputs.input_ids = input_ids.slice(null, [-num_new_tokens, null]);
-
-                // TODO: The attention mask should be formed from the attention mask passed in model_inputs
-                model_inputs.attention_mask = ones([1, past_length + num_new_tokens]);
-            }
         }
     }
 
@@ -1027,6 +1050,7 @@ export class PreTrainedModel extends Callable {
                 this._prepare_inputs_for_generation = multimodal_text_to_text_prepare_inputs_for_generation;
                 break;
             case MODEL_TYPES.Phi3V:
+            case MODEL_TYPES.ImageAudioTextToText:
                 this.can_generate = true;
                 this._prepare_inputs_for_generation = multimodal_text_to_text_prepare_inputs_for_generation;
                 break;
@@ -1180,7 +1204,19 @@ export class PreTrainedModel extends Callable {
                     generation_config: 'generation_config.json',
                 }, options),
             ]);
-
+        } else if (modelType === MODEL_TYPES.ImageAudioTextToText) {
+            const sessions = {
+                embed_tokens: 'embed_tokens',
+                audio_encoder: 'audio_encoder',
+                vision_encoder: 'vision_encoder',
+                decoder_model_merged: 'decoder_model_merged',
+            }
+            info = await Promise.all([
+                constructSessions(pretrained_model_name_or_path, sessions, options),
+                getOptionalConfigs(pretrained_model_name_or_path, {
+                    generation_config: 'generation_config.json',
+                }, options),
+            ]);
         } else if (modelType === MODEL_TYPES.Musicgen) {
             info = await Promise.all([
                 constructSessions(pretrained_model_name_or_path, {
@@ -1270,32 +1306,6 @@ export class PreTrainedModel extends Callable {
      */
     get generation_config() {
         return this.configs?.generation_config ?? null;
-    }
-
-    /**
-     * This function returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsWarper`]
-     * instances used for multinomial sampling.
-     * @param {GenerationConfig} generation_config The generation config.
-     * @returns {LogitsProcessorList} generation_config 
-     */
-    _get_logits_warper(generation_config) {
-
-        // instantiate warpers list
-        const warpers = new LogitsProcessorList();
-
-        if (generation_config.temperature !== null && generation_config.temperature !== 1.0) {
-            warpers.push(new TemperatureLogitsWarper(generation_config.temperature));
-        }
-        if (generation_config.top_k !== null && generation_config.top_k !== 0) {
-            // TODO: add min_tokens_to_keep
-            warpers.push(new TopKLogitsWarper(generation_config.top_k));
-        }
-        if (generation_config.top_p !== null && generation_config.top_p < 1.0) {
-            // TODO: add min_tokens_to_keep
-            warpers.push(new TopPLogitsWarper(generation_config.top_p));
-        }
-
-        return warpers;
     }
 
     /**
@@ -1415,6 +1425,25 @@ export class PreTrainedModel extends Callable {
         // 8. prepare batched CFG externally
         if (generation_config.guidance_scale !== null && generation_config.guidance_scale > 1) {
             processors.push(new ClassifierFreeGuidanceLogitsProcessor(generation_config.guidance_scale));
+        }
+
+
+        if (generation_config.temperature === 0 && generation_config.do_sample) {
+          console.warn('`do_sample` changed to false because `temperature: 0` implies greedy sampling (always selecting the most likely token), which is incompatible with `do_sample: true`.');
+          generation_config.do_sample = false;
+        }
+
+        if (generation_config.do_sample) {
+            if (generation_config.temperature !== null && generation_config.temperature !== 1.0) {
+                processors.push(new TemperatureLogitsWarper(generation_config.temperature));
+            }
+            // TODO: Add TopPLogitsWarper and TopKLogitsWarper
+            // if (generation_config.top_k !== null && generation_config.top_k !== 0) {
+            //     processors.push(new TopKLogitsWarper(generation_config.top_k));
+            // }
+            // if (generation_config.top_p !== null && generation_config.top_p < 1.0) {
+            //     processors.push(new TopPLogitsWarper(generation_config.top_p));
+            // }
         }
 
         if (logits_processor !== null) {
@@ -1916,7 +1945,9 @@ export class PreTrainedModel extends Callable {
 
         for (const name in decoderResults) {
             if (name.startsWith('present')) {
-                const newName = name.replace('present', 'past_key_values');
+                const newName = name
+                    .replace('present_conv', 'past_conv') // Hybrid cache architecture (e.g., LFM2)
+                    .replace('present', 'past_key_values');
                 const is_encoder_pkv = name.includes('encoder');
                 if (is_encoder_pkv && pastKeyValues) {
                     // Optimization introduced by optimum to reuse past key values.
@@ -1973,31 +2004,21 @@ export class PreTrainedModel extends Callable {
             Object.assign(decoderFeeds, pastKeyValues)
         } else {
             const session = this.sessions['decoder_model_merged'] ?? this.sessions['model'];
-            const dtype = session?.config?.kv_cache_dtype ?? 'float32';
-            const empty = (dtype === 'float16') ? new DataTypeMap.float16() : [];
-
             const batch_size = (decoderFeeds[this.main_input_name] ?? decoderFeeds.attention_mask)?.dims?.[0] ?? 1;
-            const shapes = getKeyValueShapes(this.config, { batch_size });
 
+            const dtype = session?.config?.kv_cache_dtype ?? 'float32';
+            const cls = (dtype === 'float16') ? DataTypeMap.float16 : DataTypeMap.float32;
+            const shapes = getCacheShapes(this.config, { batch_size });
             for (const name in shapes) {
-                decoderFeeds[name] = new Tensor(dtype, empty, shapes[name]);
+                const size = shapes[name].reduce((a, b) => a * b, 1);
+                decoderFeeds[name] = new Tensor(dtype, new cls(size), shapes[name]);
             }
         }
     }
 
     async encode_image({ pixel_values }) {
         // image_inputs === { pixel_values }
-        const features = (await sessionRun(this.sessions['vision_encoder'], { pixel_values })).image_features;
-        // @ts-expect-error TS2339
-        if (!this.config.num_image_tokens) {
-            console.warn(
-                'The number of image tokens was not set in the model configuration. ' +
-                `Setting it to the number of features detected by the vision encoder (${features.dims[1]}).`
-            )
-            // @ts-expect-error TS2339
-            this.config.num_image_tokens = features.dims[1];
-        }
-        return features;
+        return (await sessionRun(this.sessions['vision_encoder'], { pixel_values })).image_features;
     }
 
     async encode_text({ input_ids }) {
@@ -2099,6 +2120,60 @@ export class BertForQuestionAnswering extends BertPreTrainedModel {
 //////////////////////////////////////////////////
 
 //////////////////////////////////////////////////
+// NeoBert models
+export class NeoBertPreTrainedModel extends PreTrainedModel { }
+export class NeoBertModel extends NeoBertPreTrainedModel { }
+
+export class NeoBertForMaskedLM extends NeoBertPreTrainedModel {
+    /**
+     * Calls the model on new inputs.
+     *
+     * @param {Object} model_inputs The inputs to the model.
+     * @returns {Promise<MaskedLMOutput>} An object containing the model's output logits for masked language modeling.
+     */
+    async _call(model_inputs) {
+        return new MaskedLMOutput(await super._call(model_inputs));
+    }
+}
+
+export class NeoBertForSequenceClassification extends NeoBertPreTrainedModel {
+    /**
+     * Calls the model on new inputs.
+     *
+     * @param {Object} model_inputs The inputs to the model.
+     * @returns {Promise<SequenceClassifierOutput>} An object containing the model's output logits for sequence classification.
+     */
+    async _call(model_inputs) {
+        return new SequenceClassifierOutput(await super._call(model_inputs));
+    }
+}
+
+export class NeoBertForTokenClassification extends NeoBertPreTrainedModel {
+    /**
+     * Calls the model on new inputs.
+     *
+     * @param {Object} model_inputs The inputs to the model.
+     * @returns {Promise<TokenClassifierOutput>} An object containing the model's output logits for token classification.
+     */
+    async _call(model_inputs) {
+        return new TokenClassifierOutput(await super._call(model_inputs));
+    }
+}
+
+export class NeoBertForQuestionAnswering extends NeoBertPreTrainedModel {
+    /**
+     * Calls the model on new inputs.
+     *
+     * @param {Object} model_inputs The inputs to the model.
+     * @returns {Promise<QuestionAnsweringModelOutput>} An object containing the model's output logits for question answering.
+     */
+    async _call(model_inputs) {
+        return new QuestionAnsweringModelOutput(await super._call(model_inputs));
+    }
+}
+//////////////////////////////////////////////////
+
+//////////////////////////////////////////////////
 // ModernBert models
 export class ModernBertPreTrainedModel extends PreTrainedModel { }
 export class ModernBertModel extends ModernBertPreTrainedModel { }
@@ -2140,6 +2215,12 @@ export class ModernBertForTokenClassification extends ModernBertPreTrainedModel 
 }
 //////////////////////////////////////////////////
 
+//////////////////////////////////////////////////
+// ModernBERT Decoder models
+export class ModernBertDecoderPreTrainedModel extends PreTrainedModel { }
+export class ModernBertDecoderModel extends ModernBertDecoderPreTrainedModel { }
+export class ModernBertDecoderForCausalLM extends ModernBertDecoderPreTrainedModel { }
+//////////////////////////////////////////////////
 
 //////////////////////////////////////////////////
 // NomicBert models
@@ -3611,65 +3692,16 @@ export class LlavaPreTrainedModel extends PreTrainedModel {
  * The LLAVA model which consists of a vision backbone and a language model.
  */
 export class LlavaForConditionalGeneration extends LlavaPreTrainedModel {
+    _merge_input_ids_with_image_features(kwargs) {
+        const vision_hidden_size = kwargs.image_features.dims.at(-1);
+        const reshaped_image_hidden_states = kwargs.image_features.view(-1, vision_hidden_size);
 
-    _merge_input_ids_with_image_features({
-        inputs_embeds,
-        image_features,
-        input_ids,
-        attention_mask,
-    }) {
-
-        // @ts-expect-error TS2339
-        const image_token_index = this.config.image_token_index;
-
-        const idsList = input_ids.tolist();
-
-        // NOTE: we use .findIndex instead of .indexOf to perform weak comparison (==) between BigInt and Number
-        const indexOfImage = idsList.map(x => x.findIndex(x => x == image_token_index));
-
-        const noImages = indexOfImage.every(x => x === -1);
-        const allImages = indexOfImage.every(x => x !== -1);
-        if (!noImages && !allImages) {
-            // Check for padding reasons
-            throw new Error('Every input should contain either 0 or 1 image token.');
-        }
-
-        if (noImages) {
-            return {
-                inputs_embeds,
-                attention_mask,
-            }
-        }
-
-        const stacked = [];
-        const stacked_attention_mask = [];
-        for (let i = 0; i < indexOfImage.length; ++i) {
-            const index = indexOfImage[i];
-
-            const e = inputs_embeds[i];
-            const im = image_features[i];
-            const am = attention_mask[i];
-            stacked.push(
-                cat([
-                    e.slice([0, index]),
-                    im,
-                    e.slice([index + 1, e.dims[0]]),
-                ], 0)
-            );
-
-            stacked_attention_mask.push(
-                cat([
-                    am.slice([0, index]),
-                    ones([im.dims[0]]),
-                    am.slice([index + 1, am.dims[0]])
-                ], 0)
-            )
-        }
-
-        return {
-            inputs_embeds: stack(stacked, 0),
-            attention_mask: stack(stacked_attention_mask, 0),
-        }
+        return default_merge_input_ids_with_image_features({
+            // @ts-ignore
+            image_token_id: this.config.image_token_index,
+            ...kwargs,
+            image_features: reshaped_image_hidden_states,
+        })
     }
 }
 //////////////////////////////////////////////////
@@ -3809,6 +3841,128 @@ export class PaliGemmaForConditionalGeneration extends PaliGemmaPreTrainedModel 
         })
     }
 }
+
+export class LlavaQwen2ForCausalLM extends LlavaPreTrainedModel {
+    _merge_input_ids_with_image_features(kwargs) {
+        const vision_hidden_size = kwargs.image_features.dims.at(-1);
+        const reshaped_image_hidden_states = kwargs.image_features.view(-1, vision_hidden_size);
+
+        return default_merge_input_ids_with_image_features({
+            // @ts-ignore
+            image_token_id: this.config.image_token_index,
+            ...kwargs,
+            image_features: reshaped_image_hidden_states,
+        })
+    }
+}
+
+export class Gemma3nPreTrainedModel extends PreTrainedModel {
+    forward_params = [
+        'input_ids',
+        'attention_mask',
+        'inputs_embeds',
+        'per_layer_inputs',
+
+        'position_ids',
+        'pixel_values',
+        'input_features',
+        'input_features_mask',
+        'past_key_values',
+    ];
+}
+export class Gemma3nForConditionalGeneration extends Gemma3nPreTrainedModel {
+
+    async forward({
+        // Produced by the tokenizer/processor:
+        input_ids = null,
+        attention_mask = null,
+        pixel_values = null,
+        input_features = null,
+        input_features_mask = null,
+
+        // Used during generation:
+        position_ids = null,
+        inputs_embeds = null,
+        per_layer_inputs=null,
+        past_key_values = null,
+
+        // Generic generation parameters
+        generation_config = null,
+        logits_processor = null,
+
+        // TODO: needed?
+        ...kwargs
+    }) {
+        if (!inputs_embeds || !per_layer_inputs) {
+            // 1. Extract the text embeddings.
+            ({ inputs_embeds, per_layer_inputs} = await sessionRun(this.sessions['embed_tokens'], {
+                input_ids,
+            }));
+            if (input_ids.dims[1] !== 1) {
+                if (pixel_values) {
+                    // Encode the image
+                    const { image_features } = await sessionRun(this.sessions['vision_encoder'], {
+                        pixel_values,
+                    });
+                    ({ inputs_embeds, attention_mask } = this._merge_input_ids_with_image_features({
+                        image_features,
+                        inputs_embeds,
+                        input_ids,
+                        attention_mask,
+                    }));
+                }
+
+                if (input_features) {
+                    // Encode the audio
+                    const { audio_features } = await sessionRun(this.sessions['audio_encoder'], {
+                        input_features,
+                        input_features_mask,
+                    });
+                    ({ inputs_embeds, attention_mask } = this._merge_input_ids_with_audio_features({
+                        audio_features,
+                        inputs_embeds,
+                        input_ids,
+                        attention_mask,
+                    }));
+                }
+            }
+        }
+
+        const outputs = await decoderForward(this, {
+            inputs_embeds,
+            per_layer_inputs,
+            past_key_values,
+            attention_mask,
+            position_ids,
+            generation_config,
+            logits_processor,
+        }, true);
+        return outputs;
+    }
+
+    _merge_input_ids_with_image_features(kwargs) {
+        const vision_hidden_size = kwargs.image_features.dims.at(-1);
+        const reshaped_image_hidden_states = kwargs.image_features.view(-1, vision_hidden_size);
+        return default_merge_input_ids_with_image_features({
+            // @ts-ignore
+            image_token_id: this.config.image_token_id,
+            ...kwargs,
+            image_features: reshaped_image_hidden_states,
+        });
+    }
+    _merge_input_ids_with_audio_features(kwargs) {
+        const audio_hidden_size = kwargs.audio_features.dims.at(-1);
+        const reshaped_audio_features = kwargs.audio_features.view(-1, audio_hidden_size);
+
+        return default_merge_input_ids_with_audio_features({
+            // @ts-ignore
+            audio_token_id: this.config.audio_token_id,
+            ...kwargs,
+            audio_features: reshaped_audio_features,
+        })
+    }
+}
+        
 
 //////////////////////////////////////////////////
 // Idefics3 Models
@@ -4425,6 +4579,34 @@ export class LlamaModel extends LlamaPreTrainedModel { }
 export class LlamaForCausalLM extends LlamaPreTrainedModel { }
 //////////////////////////////////////////////////
 
+
+//////////////////////////////////////////////////
+export class Llama4PreTrainedModel extends PreTrainedModel { }
+export class Llama4ForCausalLM extends Llama4PreTrainedModel { }
+//////////////////////////////////////////////////
+
+
+//////////////////////////////////////////////////
+// Arcee models
+export class ArceePreTrainedModel extends PreTrainedModel { }
+export class ArceeModel extends ArceePreTrainedModel { }
+export class ArceeForCausalLM extends ArceePreTrainedModel { }
+//////////////////////////////////////////////////
+
+//////////////////////////////////////////////////
+// LFM2 models
+export class Lfm2PreTrainedModel extends PreTrainedModel { }
+export class Lfm2Model extends Lfm2PreTrainedModel { }
+export class Lfm2ForCausalLM extends Lfm2PreTrainedModel { }
+//////////////////////////////////////////////////
+
+//////////////////////////////////////////////////
+// SmolLM3 models
+export class SmolLM3PreTrainedModel extends PreTrainedModel { }
+export class SmolLM3Model extends SmolLM3PreTrainedModel { }
+export class SmolLM3ForCausalLM extends SmolLM3PreTrainedModel { }
+//////////////////////////////////////////////////
+
 //////////////////////////////////////////////////
 // Helium models
 export class HeliumPreTrainedModel extends PreTrainedModel { }
@@ -4477,6 +4659,12 @@ export class GraniteModel extends GranitePreTrainedModel { }
 export class GraniteForCausalLM extends GranitePreTrainedModel { }
 //////////////////////////////////////////////////
 
+//////////////////////////////////////////////////
+// GraniteMoeHybrid models
+export class GraniteMoeHybridPreTrainedModel extends PreTrainedModel { }
+export class GraniteMoeHybridModel extends GraniteMoeHybridPreTrainedModel { }
+export class GraniteMoeHybridForCausalLM extends GraniteMoeHybridPreTrainedModel { }
+//////////////////////////////////////////////////
 
 //////////////////////////////////////////////////
 // Cohere models
@@ -4520,6 +4708,12 @@ export class Gemma2Model extends Gemma2PreTrainedModel { }
 export class Gemma2ForCausalLM extends Gemma2PreTrainedModel { }
 //////////////////////////////////////////////////
 
+//////////////////////////////////////////////////
+// VaultGemma models
+export class VaultGemmaPreTrainedModel extends PreTrainedModel { }
+export class VaultGemmaModel extends VaultGemmaPreTrainedModel { }
+export class VaultGemmaForCausalLM extends VaultGemmaPreTrainedModel { }
+//////////////////////////////////////////////////
 
 //////////////////////////////////////////////////
 // Gemma3 models
@@ -4557,6 +4751,22 @@ export class Qwen2PreTrainedModel extends PreTrainedModel { }
 export class Qwen2Model extends Qwen2PreTrainedModel { }
 
 export class Qwen2ForCausalLM extends Qwen2PreTrainedModel { }
+//////////////////////////////////////////////////
+
+
+//////////////////////////////////////////////////
+// Qwen3 models
+
+/**
+ * The bare Qwen3 Model outputting raw hidden-states without any specific head on top.
+ */
+export class Qwen3PreTrainedModel extends PreTrainedModel { }
+/**
+ * The bare Qwen3 Model outputting raw hidden-states without any specific head on top.
+ */
+export class Qwen3Model extends Qwen3PreTrainedModel { }
+
+export class Qwen3ForCausalLM extends Qwen3PreTrainedModel { }
 //////////////////////////////////////////////////
 
 export class Qwen2VLPreTrainedModel extends PreTrainedModel {
@@ -5181,6 +5391,50 @@ export class RTDetrObjectDetectionOutput extends ModelOutput {
 }
 //////////////////////////////////////////////////
 
+
+//////////////////////////////////////////////////
+export class RTDetrV2PreTrainedModel extends PreTrainedModel { }
+export class RTDetrV2Model extends RTDetrV2PreTrainedModel { }
+export class RTDetrV2ForObjectDetection extends RTDetrV2PreTrainedModel {
+    /**
+     * @param {any} model_inputs
+     */
+    async _call(model_inputs) {
+        return new RTDetrV2ObjectDetectionOutput(await super._call(model_inputs));
+    }
+}
+
+export class RTDetrV2ObjectDetectionOutput extends RTDetrObjectDetectionOutput { }
+//////////////////////////////////////////////////
+
+//////////////////////////////////////////////////
+export class RFDetrPreTrainedModel extends PreTrainedModel { }
+export class RFDetrModel extends RFDetrPreTrainedModel { }
+export class RFDetrForObjectDetection extends RFDetrPreTrainedModel {
+    /**
+     * @param {any} model_inputs
+     */
+    async _call(model_inputs) {
+        return new RFDetrObjectDetectionOutput(await super._call(model_inputs));
+    }
+}
+
+export class RFDetrObjectDetectionOutput extends RTDetrObjectDetectionOutput { }
+//////////////////////////////////////////////////
+
+//////////////////////////////////////////////////
+export class DFinePreTrainedModel extends PreTrainedModel { }
+export class DFineModel extends DFinePreTrainedModel { }
+export class DFineForObjectDetection extends DFinePreTrainedModel {
+    /**
+     * @param {any} model_inputs
+     */
+    async _call(model_inputs) {
+        return new RTDetrObjectDetectionOutput(await super._call(model_inputs));
+    }
+}
+//////////////////////////////////////////////////
+
 //////////////////////////////////////////////////
 export class TableTransformerPreTrainedModel extends PreTrainedModel { }
 
@@ -5617,6 +5871,18 @@ export class Dinov2WithRegistersForImageClassification extends Dinov2WithRegiste
         return new SequenceClassifierOutput(await super._call(model_inputs));
     }
 }
+//////////////////////////////////////////////////
+
+//////////////////////////////////////////////////
+export class DINOv3ViTPreTrainedModel extends PreTrainedModel { }
+export class DINOv3ViTModel extends DINOv3ViTPreTrainedModel { }
+//////////////////////////////////////////////////
+
+//////////////////////////////////////////////////
+export class DINOv3ConvNextPreTrainedModel extends PreTrainedModel { }
+export class DINOv3ConvNextModel extends DINOv3ConvNextPreTrainedModel { }
+//////////////////////////////////////////////////
+
 //////////////////////////////////////////////////
 export class GroundingDinoPreTrainedModel extends PreTrainedModel { }
 export class GroundingDinoForObjectDetection extends GroundingDinoPreTrainedModel { }
@@ -6511,6 +6777,15 @@ export class MistralModel extends MistralPreTrainedModel { }
 export class MistralForCausalLM extends MistralPreTrainedModel { }
 //////////////////////////////////////////////////
 
+//////////////////////////////////////////////////
+// ERNIE-4.5 models
+export class Ernie4_5_PretrainedModel extends PreTrainedModel { }
+
+export class Ernie4_5_Model extends Ernie4_5_PretrainedModel { }
+
+export class Ernie4_5_ForCausalLM extends Ernie4_5_PretrainedModel { }
+//////////////////////////////////////////////////
+
 
 //////////////////////////////////////////////////
 // Starcoder2 models
@@ -6964,7 +7239,7 @@ export class DecisionTransformerPreTrainedModel extends PreTrainedModel { }
 
 /**
  * The model builds upon the GPT2 architecture to perform autoregressive prediction of actions in an offline RL setting.
- * Refer to the paper for more details: https://arxiv.org/abs/2106.01345
+ * Refer to the paper for more details: https://huggingface.co/papers/2106.01345
  */
 export class DecisionTransformerModel extends DecisionTransformerPreTrainedModel { }
 
@@ -7155,13 +7430,15 @@ export class UltravoxModel extends UltravoxPreTrainedModel {
 
         return default_merge_input_ids_with_audio_features({
             // @ts-ignore
-            audio_token_id: this.config.ignore_index,
+            audio_token_id: this.config.ignore_index ?? this.config.audio_token_id,
             ...kwargs,
             audio_features: reshaped_audio_features,
         })
     }
 }
 //////////////////////////////////////////////////
+
+export class VoxtralForConditionalGeneration extends UltravoxModel { }
 
 //////////////////////////////////////////////////
 // Mimi models
@@ -7452,6 +7729,7 @@ export class PretrainedMixin {
 
 const MODEL_MAPPING_NAMES_ENCODER_ONLY = new Map([
     ['bert', ['BertModel', BertModel]],
+    ['neobert', ['NeoBertModel', NeoBertModel]],
     ['modernbert', ['ModernBertModel', ModernBertModel]],
     ['nomic_bert', ['NomicBertModel', NomicBertModel]],
     ['roformer', ['RoFormerModel', RoFormerModel]],
@@ -7488,6 +7766,9 @@ const MODEL_MAPPING_NAMES_ENCODER_ONLY = new Map([
 
     ['detr', ['DetrModel', DetrModel]],
     ['rt_detr', ['RTDetrModel', RTDetrModel]],
+    ['rt_detr_v2', ['RTDetrV2Model', RTDetrV2Model]],
+    ['rf_detr', ['RFDetrModel', RFDetrModel]],
+    ['d_fine', ['DFineModel', DFineModel]],
     ['table-transformer', ['TableTransformerModel', TableTransformerModel]],
     ['vit', ['ViTModel', ViTModel]],
     ['ijepa', ['IJepaModel', IJepaModel]],
@@ -7507,6 +7788,8 @@ const MODEL_MAPPING_NAMES_ENCODER_ONLY = new Map([
     ['convnextv2', ['ConvNextV2Model', ConvNextV2Model]],
     ['dinov2', ['Dinov2Model', Dinov2Model]],
     ['dinov2_with_registers', ['Dinov2WithRegistersModel', Dinov2WithRegistersModel]],
+    ['dinov3_vit', ['DINOv3ViTModel', DINOv3ViTModel]],
+    ['dinov3_convnext', ['DINOv3ConvNextModel', DINOv3ConvNextModel]],
     ['resnet', ['ResNetModel', ResNetModel]],
     ['swin', ['SwinModel', SwinModel]],
     ['swin2sr', ['Swin2SRModel', Swin2SRModel]],
@@ -7562,27 +7845,35 @@ const MODEL_MAPPING_NAMES_DECODER_ONLY = new Map([
     ['gpt_neox', ['GPTNeoXModel', GPTNeoXModel]],
     ['codegen', ['CodeGenModel', CodeGenModel]],
     ['llama', ['LlamaModel', LlamaModel]],
+    ['arcee', ['ArceeModel', ArceeModel]],
+    ['lfm2', ['Lfm2Model', Lfm2Model]],
+    ['smollm3', ['SmolLM3Model', SmolLM3Model]],
     ['exaone', ['ExaoneModel', ExaoneModel]],
     ['olmo', ['OlmoModel', OlmoModel]],
     ['olmo2', ['Olmo2Model', Olmo2Model]],
     ['mobilellm', ['MobileLLMModel', MobileLLMModel]],
     ['granite', ['GraniteModel', GraniteModel]],
+    ['granitemoehybrid', ['GraniteMoeHybridModel', GraniteMoeHybridModel]],
     ['cohere', ['CohereModel', CohereModel]],
     ['gemma', ['GemmaModel', GemmaModel]],
     ['gemma2', ['Gemma2Model', Gemma2Model]],
+    ['vaultgemma', ['VaultGemmaModel', VaultGemmaModel]],
     ['gemma3_text', ['Gemma3Model', Gemma3Model]],
     ['helium', ['HeliumModel', HeliumModel]],
     ['glm', ['GlmModel', GlmModel]],
     ['openelm', ['OpenELMModel', OpenELMModel]],
     ['qwen2', ['Qwen2Model', Qwen2Model]],
+    ['qwen3', ['Qwen3Model', Qwen3Model]],
     ['phi', ['PhiModel', PhiModel]],
     ['phi3', ['Phi3Model', Phi3Model]],
     ['mpt', ['MptModel', MptModel]],
     ['opt', ['OPTModel', OPTModel]],
     ['mistral', ['MistralModel', MistralModel]],
+    ['ernie4_5', ['Ernie4_5_Model', Ernie4_5_Model]],
     ['starcoder2', ['Starcoder2Model', Starcoder2Model]],
     ['falcon', ['FalconModel', FalconModel]],
     ['stablelm', ['StableLmModel', StableLmModel]],
+    ['modernbert-decoder', ['ModernBertDecoderModel', ModernBertDecoderModel]],
 ]);
 
 const MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES = new Map([
@@ -7603,6 +7894,7 @@ const MODEL_FOR_TEXT_TO_WAVEFORM_MAPPING_NAMES = new Map([
 
 const MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING_NAMES = new Map([
     ['bert', ['BertForSequenceClassification', BertForSequenceClassification]],
+    ['neobert', ['NeoBertForSequenceClassification', NeoBertForSequenceClassification]],
     ['modernbert', ['ModernBertForSequenceClassification', ModernBertForSequenceClassification]],
     ['roformer', ['RoFormerForSequenceClassification', RoFormerForSequenceClassification]],
     ['electra', ['ElectraForSequenceClassification', ElectraForSequenceClassification]],
@@ -7625,6 +7917,7 @@ const MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING_NAMES = new Map([
 
 const MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING_NAMES = new Map([
     ['bert', ['BertForTokenClassification', BertForTokenClassification]],
+    ['neobert', ['NeoBertForTokenClassification', NeoBertForTokenClassification]],
     ['modernbert', ['ModernBertForTokenClassification', ModernBertForTokenClassification]],
     ['roformer', ['RoFormerForTokenClassification', RoFormerForTokenClassification]],
     ['electra', ['ElectraForTokenClassification', ElectraForTokenClassification]],
@@ -7662,29 +7955,38 @@ const MODEL_FOR_CAUSAL_LM_MAPPING_NAMES = new Map([
     ['gpt_neox', ['GPTNeoXForCausalLM', GPTNeoXForCausalLM]],
     ['codegen', ['CodeGenForCausalLM', CodeGenForCausalLM]],
     ['llama', ['LlamaForCausalLM', LlamaForCausalLM]],
+    ['llama4_text', ['Llama4ForCausalLM', Llama4ForCausalLM]],
+    ['arcee', ['ArceeForCausalLM', ArceeForCausalLM]],
+    ['lfm2', ['Lfm2ForCausalLM', Lfm2ForCausalLM]],
+    ['smollm3', ['SmolLM3ForCausalLM', SmolLM3ForCausalLM]],
     ['exaone', ['ExaoneForCausalLM', ExaoneForCausalLM]],
     ['olmo', ['OlmoForCausalLM', OlmoForCausalLM]],
     ['olmo2', ['Olmo2ForCausalLM', Olmo2ForCausalLM]],
     ['mobilellm', ['MobileLLMForCausalLM', MobileLLMForCausalLM]],
     ['granite', ['GraniteForCausalLM', GraniteForCausalLM]],
+    ['granitemoehybrid', ['GraniteMoeHybridForCausalLM', GraniteMoeHybridForCausalLM]],
     ['cohere', ['CohereForCausalLM', CohereForCausalLM]],
     ['gemma', ['GemmaForCausalLM', GemmaForCausalLM]],
     ['gemma2', ['Gemma2ForCausalLM', Gemma2ForCausalLM]],
+    ['vaultgemma', ['VaultGemmaForCausalLM', VaultGemmaForCausalLM]],
     ['gemma3_text', ['Gemma3ForCausalLM', Gemma3ForCausalLM]],
     ['helium', ['HeliumForCausalLM', HeliumForCausalLM]],
     ['glm', ['GlmForCausalLM', GlmForCausalLM]],
     ['openelm', ['OpenELMForCausalLM', OpenELMForCausalLM]],
     ['qwen2', ['Qwen2ForCausalLM', Qwen2ForCausalLM]],
+    ['qwen3', ['Qwen3ForCausalLM', Qwen3ForCausalLM]],
     ['phi', ['PhiForCausalLM', PhiForCausalLM]],
     ['phi3', ['Phi3ForCausalLM', Phi3ForCausalLM]],
     ['mpt', ['MptForCausalLM', MptForCausalLM]],
     ['opt', ['OPTForCausalLM', OPTForCausalLM]],
     ['mbart', ['MBartForCausalLM', MBartForCausalLM]],
     ['mistral', ['MistralForCausalLM', MistralForCausalLM]],
+    ['ernie4_5', ['Ernie4_5_ForCausalLM', Ernie4_5_ForCausalLM]],
     ['starcoder2', ['Starcoder2ForCausalLM', Starcoder2ForCausalLM]],
     ['falcon', ['FalconForCausalLM', FalconForCausalLM]],
     ['trocr', ['TrOCRForCausalLM', TrOCRForCausalLM]],
     ['stablelm', ['StableLmForCausalLM', StableLmForCausalLM]],
+    ['modernbert-decoder', ['ModernBertDecoderForCausalLM', ModernBertDecoderForCausalLM]],
 
     // Also image-text-to-text
     ['phi3_v', ['Phi3VForCausalLM', Phi3VForCausalLM]],
@@ -7697,6 +7999,7 @@ const MODEL_FOR_MULTIMODALITY_MAPPING_NAMES = new Map([
 
 const MODEL_FOR_MASKED_LM_MAPPING_NAMES = new Map([
     ['bert', ['BertForMaskedLM', BertForMaskedLM]],
+    ['neobert', ['NeoBertForMaskedLM', NeoBertForMaskedLM]],
     ['modernbert', ['ModernBertForMaskedLM', ModernBertForMaskedLM]],
     ['roformer', ['RoFormerForMaskedLM', RoFormerForMaskedLM]],
     ['electra', ['ElectraForMaskedLM', ElectraForMaskedLM]],
@@ -7717,6 +8020,7 @@ const MODEL_FOR_MASKED_LM_MAPPING_NAMES = new Map([
 
 const MODEL_FOR_QUESTION_ANSWERING_MAPPING_NAMES = new Map([
     ['bert', ['BertForQuestionAnswering', BertForQuestionAnswering]],
+    ['neobert', ['NeoBertForQuestionAnswering', NeoBertForQuestionAnswering]],
     ['roformer', ['RoFormerForQuestionAnswering', RoFormerForQuestionAnswering]],
     ['electra', ['ElectraForQuestionAnswering', ElectraForQuestionAnswering]],
     ['convbert', ['ConvBertForQuestionAnswering', ConvBertForQuestionAnswering]],
@@ -7748,10 +8052,13 @@ const MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES = new Map([
     ['idefics3', ['Idefics3ForConditionalGeneration', Idefics3ForConditionalGeneration]],
     ['smolvlm', ['SmolVLMForConditionalGeneration', SmolVLMForConditionalGeneration]],
     ['paligemma', ['PaliGemmaForConditionalGeneration', PaliGemmaForConditionalGeneration]],
+    ['llava_qwen2', ['LlavaQwen2ForCausalLM', LlavaQwen2ForCausalLM]],
+    ['gemma3n', ['Gemma3nForConditionalGeneration', Gemma3nForConditionalGeneration]],
 ]);
 
 const MODEL_FOR_AUDIO_TEXT_TO_TEXT_MAPPING_NAMES = new Map([
     ['ultravox', ['UltravoxModel', UltravoxModel]],
+    ['voxtral', ['VoxtralForConditionalGeneration', VoxtralForConditionalGeneration]],
 ]);
 
 
@@ -7787,6 +8094,9 @@ const MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES = new Map([
 const MODEL_FOR_OBJECT_DETECTION_MAPPING_NAMES = new Map([
     ['detr', ['DetrForObjectDetection', DetrForObjectDetection]],
     ['rt_detr', ['RTDetrForObjectDetection', RTDetrForObjectDetection]],
+    ['rt_detr_v2', ['RTDetrV2ForObjectDetection', RTDetrV2ForObjectDetection]],
+    ['rf_detr', ['RFDetrForObjectDetection', RFDetrForObjectDetection]],
+    ['d_fine', ['DFineForObjectDetection', DFineForObjectDetection]],
     ['table-transformer', ['TableTransformerForObjectDetection', TableTransformerForObjectDetection]],
     ['yolos', ['YolosForObjectDetection', YolosForObjectDetection]],
 ]);
@@ -7961,6 +8271,8 @@ const CUSTOM_MAPPING = [
     ['MimiDecoderModel', MimiDecoderModel, MODEL_TYPES.EncoderOnly],
     ['SnacEncoderModel', SnacEncoderModel, MODEL_TYPES.EncoderOnly],
     ['SnacDecoderModel', SnacDecoderModel, MODEL_TYPES.EncoderOnly],
+
+    ['Gemma3nForConditionalGeneration', Gemma3nForConditionalGeneration, MODEL_TYPES.ImageAudioTextToText],
 ]
 for (const [name, model, type] of CUSTOM_MAPPING) {
     MODEL_TYPE_MAPPING.set(name, type);

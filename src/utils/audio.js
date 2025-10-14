@@ -15,9 +15,8 @@ import {
     calculateReflectOffset, saveBlob,
 } from './core.js';
 import { apis } from '../env.js';
-import fs from 'fs';
 import { Tensor, matmul } from './tensor.js';
-
+import fs from 'node:fs';
 
 /**
  * Helper function to read audio from a path/URL.
@@ -235,7 +234,8 @@ function linspace(start, end, num) {
  * various implementation exist, which differ in the number of filters, the shape of the filters, the way the filters
  * are spaced, the bandwidth of the filters, and the manner in which the spectrum is warped. The goal of these
  * features is to approximate the non-linear human perception of the variation in pitch with respect to the frequency.
- * @param {number} num_frequency_bins Number of frequencies used to compute the spectrogram (should be the same as in `stft`).
+ * @param {number} num_frequency_bins Number of frequency bins (should be the same as `n_fft // 2 + 1`
+ * where `n_fft` is the size of the Fourier Transform used to compute the spectrogram).
  * @param {number} num_mel_filters Number of mel filters to generate.
  * @param {number} min_frequency Lowest frequency of interest in Hz.
  * @param {number} max_frequency Highest frequency of interest in Hz. This should not exceed `sampling_rate / 2`.
@@ -261,6 +261,14 @@ export function mel_filter_bank(
         throw new Error('norm must be one of null or "slaney"');
     }
 
+    if (num_frequency_bins < 2) {
+        throw new Error(`Require num_frequency_bins: ${num_frequency_bins} >= 2`);
+    }
+
+    if (min_frequency > max_frequency) {
+        throw new Error(`Require min_frequency: ${min_frequency} <= max_frequency: ${max_frequency}`);
+    }
+
     const mel_min = hertz_to_mel(min_frequency, mel_scale);
     const mel_max = hertz_to_mel(max_frequency, mel_scale);
     const mel_freqs = linspace(mel_min, mel_max, num_mel_filters + 2);
@@ -269,7 +277,7 @@ export function mel_filter_bank(
     let fft_freqs; // frequencies of FFT bins in Hz
 
     if (triangularize_in_mel_space) {
-        const fft_bin_width = sampling_rate / (num_frequency_bins * 2);
+        const fft_bin_width = sampling_rate / ((num_frequency_bins - 1) * 2);
         fft_freqs = hertz_to_mel(Float64Array.from({ length: num_frequency_bins }, (_, i) => i * fft_bin_width), mel_scale);
         filter_freqs = mel_freqs;
     } else {
@@ -442,6 +450,7 @@ function power_to_db(spectrogram, reference = 1.0, min_value = 1e-10, db_range =
  * @param {boolean} [options.onesided=true] If `true`, only computes the positive frequencies and returns a spectrogram containing `fft_length // 2 + 1`
  * frequency bins. If `false`, also computes the negative frequencies and returns `fft_length` frequency bins.
  * @param {number} [options.preemphasis=null] Coefficient for a low-pass filter that applies pre-emphasis before the DFT.
+ * @param {boolean} [options.preemphasis_htk_flavor=true] Whether to apply the pre-emphasis filter in the HTK flavor.
  * @param {number[][]} [options.mel_filters=null] The mel filter bank of shape `(num_freq_bins, num_mel_filters)`.
  * If supplied, applies this filter bank to create a mel spectrogram.
  * @param {number} [options.mel_floor=1e-10] Minimum value of mel frequency banks.
@@ -475,6 +484,7 @@ export async function spectrogram(
         pad_mode = "reflect",
         onesided = true,
         preemphasis = null,
+        preemphasis_htk_flavor = true,
         mel_filters = null,
         mel_floor = 1e-10,
         log_mel = null,
@@ -510,6 +520,12 @@ export async function spectrogram(
         throw new Error(
             "You have provided `mel_filters` but `power` is `None`. Mel spectrogram computation is not yet supported for complex-valued spectrogram. " +
             "Specify `power` to fix this issue."
+        );
+    }
+
+    if (!preemphasis_htk_flavor) {
+        throw new Error(
+            "`preemphasis_htk_flavor=false` is not currently supported."
         );
     }
 
@@ -575,7 +591,7 @@ export async function spectrogram(
         }
 
         if (preemphasis !== null) {
-            // Done in reverse to avoid copies and distructive modification
+            // Done in reverse to avoid copies and destructive modification
             for (let j = buffer_size - 1; j >= 1; --j) {
                 inputBuffer[j] -= preemphasis * inputBuffer[j - 1];
             }
@@ -600,7 +616,7 @@ export async function spectrogram(
 
     if (power !== null && power !== 2) {
         // slight optimization to not sqrt
-        const pow = 2 / power; // we use 2 since we already squared
+        const pow = power / 2; // we use 2 since we already squared
         for (let i = 0; i < transposedMagnitudeData.length; ++i) {
             transposedMagnitudeData[i] **= pow;
         }

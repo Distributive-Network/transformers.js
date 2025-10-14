@@ -72,7 +72,9 @@ function getNormalizedConfig(config) {
         case 'llava_onevision':
         case 'idefics3':
         case 'ultravox':
+        case 'voxtral':
         case 'smolvlm':
+        case 'gemma3n':
             // @ts-expect-error TS2339
             init_normalized_config = getNormalizedConfig(config.text_config);
             break;
@@ -103,15 +105,21 @@ function getNormalizedConfig(config) {
         case 'stablelm':
         case 'opt':
         case 'falcon':
+        case 'modernbert-decoder':
             mapping['num_heads'] = 'num_attention_heads';
             mapping['num_layers'] = 'num_hidden_layers';
             mapping['hidden_size'] = 'hidden_size';
             break;
         case 'llama':
+        case 'llama4_text':
+        case 'arcee':
+        case 'lfm2':
+        case 'smollm3':
         case 'olmo':
         case 'olmo2':
         case 'mobilellm':
         case 'granite':
+        case 'granitemoehybrid':
         case 'cohere':
         case 'mistral':
         case 'starcoder2':
@@ -120,16 +128,22 @@ function getNormalizedConfig(config) {
         case 'phi':
         case 'phi3':
         case 'phi3_v':
+        case 'llava_qwen2':
             mapping['num_heads'] = 'num_key_value_heads';
             mapping['num_layers'] = 'num_hidden_layers';
             mapping['hidden_size'] = 'hidden_size';
             mapping['num_attention_heads'] = 'num_attention_heads';
+            mapping['dim_kv'] = 'head_dim';
             break;
+        case 'qwen3':
         case 'gemma':
         case 'gemma2':
+        case 'vaultgemma':
         case 'gemma3_text':
+        case 'gemma3n_text':
         case 'glm':
         case 'helium':
+        case 'ernie4_5':
             mapping['num_heads'] = 'num_key_value_heads';
             mapping['num_layers'] = 'num_hidden_layers';
             mapping['dim_kv'] = 'head_dim';
@@ -255,9 +269,38 @@ function getNormalizedConfig(config) {
  * @param {PretrainedConfig} config 
  * @returns {Record<string, number[]>}
  */
-export function getKeyValueShapes(config, {
+export function getCacheShapes(config, options) {
+    if (config.model_type === 'lfm2') {
+        const pkv_prefix = options?.prefix ?? 'past_key_values';
+        const conv_prefix = pkv_prefix === 'present' ? 'present' : 'past';
+
+        // Custom caching mechanism for LFM2
+        /** @type {Record<string, number[]>} */
+        const cache_values = {};
+        // @ts-expect-error TS2339
+        const { layer_types, num_attention_heads, num_key_value_heads, hidden_size, conv_L_cache } = config;
+        const head_dim = hidden_size / num_attention_heads;
+        const batch_size = options?.batch_size ?? 1;
+        for (let i = 0; i < layer_types.length; ++i) {
+            if (layer_types[i] === 'full_attention') {
+                for (const kv of ['key', 'value']) {
+                    cache_values[`${pkv_prefix}.${i}.${kv}`] = [batch_size, num_key_value_heads, 0, head_dim];
+                }
+            } else if (layer_types[i] === 'conv') {
+                cache_values[`${conv_prefix}_conv.${i}`] = [batch_size, hidden_size, conv_L_cache];
+            } else {
+                throw new Error(`Unsupported layer type: ${layer_types[i]}`);
+            }
+        }
+        return cache_values;
+    }
+    return getKeyValueShapes(config, options);
+}
+
+/** @type {typeof getKeyValueShapes} */
+function getKeyValueShapes(config, {
     prefix = 'past_key_values',
-    batch_size=1,
+    batch_size = 1,
 } = {}) {
     /** @type {Record<string, number[]>} */
     const decoderFeeds = {};
@@ -404,6 +447,7 @@ export class AutoConfig {
 /**
  * Transformers.js-specific configuration, possibly present in config.json under the key `transformers.js_config`.
  * @typedef {Object} TransformersJSConfig
+ * @property {Record<import('./utils/devices.js').DeviceType, DeviceConfig>} [device_config] Device-specific configurations.
  * @property {import('./utils/tensor.js').DataType|Record<import('./utils/dtypes.js').DataType, import('./utils/tensor.js').DataType>} [kv_cache_dtype] The data type of the key-value cache.
  * @property {Record<string, number>} [free_dimension_overrides] Override the free dimensions of the model.
  * See https://onnxruntime.ai/docs/tutorials/web/env-flags-and-session-options.html#freedimensionoverrides
@@ -411,4 +455,9 @@ export class AutoConfig {
  * @property {import('./utils/devices.js').DeviceType} [device] The default device to use for the model.
  * @property {import('./utils/dtypes.js').DataType|Record<string, import('./utils/dtypes.js').DataType>} [dtype] The default data type to use for the model.
  * @property {import('./utils/hub.js').ExternalData|Record<string, import('./utils/hub.js').ExternalData>} [use_external_data_format=false] Whether to load the model using the external data format (used for models >= 2GB in size).
+ */
+
+/**
+ * Device-specific configuration options.
+ * @typedef {Omit<TransformersJSConfig, "device" | "device_config">} DeviceConfig
  */

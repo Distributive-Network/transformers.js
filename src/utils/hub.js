@@ -1,12 +1,12 @@
 
 /**
  * @file Utility functions to interact with the Hugging Face Hub (https://huggingface.co/models)
- * 
+ *
  * @module utils/hub
  */
 
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 
 import { apis, env } from '../env.js';
 import { dispatchCallback } from './core.js';
@@ -19,7 +19,7 @@ import { dispatchCallback } from './core.js';
 export const MAX_EXTERNAL_DATA_CHUNKS = 100;
 
 /**
- * @typedef {Object} PretrainedOptions Options for loading a pretrained model.     
+ * @typedef {Object} PretrainedOptions Options for loading a pretrained model.
  * @property {import('./core.js').ProgressCallback} [progress_callback=null] If specified, this function will be called during model construction, to provide the user with progress updates.
  * @property {import('../configs.js').PretrainedConfig} [config=null] Configuration for the model to use instead of an automatically loaded configuration. Configuration can be automatically loaded when:
  * - The model is a model provided by the library (loaded with the *model id* string of a pretrained model).
@@ -158,7 +158,7 @@ class FileResponse {
     /**
      * Reads the contents of the file specified by the filePath property and returns a Promise that
      * resolves with a parsed JavaScript object containing the file's contents.
-     * 
+     *
      * @returns {Promise<Object>} A Promise that resolves with a parsed JavaScript object containing the file's contents.
      * @throws {Error} If the file cannot be read.
      */
@@ -190,6 +190,22 @@ function isValidUrl(string, protocols = null, validHosts = null) {
     return true;
 }
 
+const REPO_ID_REGEX = /^(\b[\w\-.]+\b\/)?\b[\w\-.]{1,96}\b$/;
+
+/**
+ * Tests whether a string is a valid Hugging Face model ID or not.
+ * Adapted from https://github.com/huggingface/huggingface_hub/blob/6378820ebb03f071988a96c7f3268f5bdf8f9449/src/huggingface_hub/utils/_validators.py#L119-L170
+ *
+ * @param {string} string The string to test
+ * @returns {boolean} True if the string is a valid model ID, false otherwise.
+ */
+function isValidHfModelId(string) {
+    if (!REPO_ID_REGEX.test(string)) return false;
+    if (string.includes("..") || string.includes("--")) return false;
+    if (string.endsWith(".git") || string.endsWith(".ipynb")) return false;
+    return true;
+}
+
 /**
  * Helper function to get a file, using either the Fetch API or FileSystem API.
  *
@@ -198,9 +214,14 @@ function isValidUrl(string, protocols = null, validHosts = null) {
  */
 export async function getFile(urlOrPath) {
 
-    if (env.useFS && !isValidUrl(urlOrPath, ['http:', 'https:', 'blob:'])) {
-        return new FileResponse(urlOrPath.toString());
-
+    if (env.useFS && !isValidUrl(urlOrPath, ["http:", "https:", "blob:"])) {
+        return new FileResponse(
+          urlOrPath instanceof URL
+            ? urlOrPath.protocol === "file:"
+              ? urlOrPath.pathname
+              : urlOrPath.toString()
+            : urlOrPath,
+        );
     } else if (typeof process !== 'undefined' && process?.release?.name === 'node') {
         const IS_CI = !!process.env?.TESTING_REMOTELY;
         const version = env.version;
@@ -264,7 +285,7 @@ function handleError(status, remoteURL, fatal) {
 class FileCache {
     /**
      * Instantiate a `FileCache` object.
-     * @param {string} path 
+     * @param {string} path
      */
     constructor(path) {
         this.path = path;
@@ -272,7 +293,7 @@ class FileCache {
 
     /**
      * Checks whether the given request is in the cache.
-     * @param {string} request 
+     * @param {string} request
      * @returns {Promise<FileResponse | undefined>}
      */
     async match(request) {
@@ -289,8 +310,8 @@ class FileCache {
 
     /**
      * Adds the given response to the cache.
-     * @param {string} request 
-     * @param {Response} response 
+     * @param {string} request
+     * @param {Response} response
      * @param {(data: {progress: number, loaded: number, total: number}) => void} [progress_callback] Optional.
      * The function to call with progress updates
      * @returns {Promise<void>}
@@ -348,7 +369,7 @@ class FileCache {
 }
 
 /**
- * 
+ *
  * @param {FileCache|Cache} cache The cache to search
  * @param {string[]} names The names of the item to search for
  * @returns {Promise<FileResponse|Response|undefined>} The item from the cache, or undefined if not found.
@@ -402,6 +423,22 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
     // First, check if the a caching backend is available
     // If no caching mechanism available, will download the file every time
     let cache;
+    if (!cache && env.useCustomCache) {
+        // Allow the user to specify a custom cache system.
+        if (!env.customCache) {
+            throw Error('`env.useCustomCache=true`, but `env.customCache` is not defined.')
+        }
+
+        // Check that the required methods are defined:
+        if (!env.customCache.match || !env.customCache.put) {
+            throw new Error(
+                "`env.customCache` must be an object which implements the `match` and `put` functions of the Web Cache API. " +
+                "For more information, see https://developer.mozilla.org/en-US/docs/Web/API/Cache"
+            )
+        }
+        cache = env.customCache;
+    }
+
     if (!cache && env.useBrowserCache) {
         if (typeof caches === 'undefined') {
             throw Error('Browser cache is not available in this environment.')
@@ -419,35 +456,22 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
     }
 
     if (!cache && env.useFSCache) {
-        // TODO throw error if not available
+        if (!apis.IS_FS_AVAILABLE) {
+            throw Error('File System Cache is not available in this environment.');
+        }
 
         // If `cache_dir` is not specified, use the default cache directory
         cache = new FileCache(options.cache_dir ?? env.cacheDir);
     }
 
-    if (!cache && env.useCustomCache) {
-        // Allow the user to specify a custom cache system.
-        if (!env.customCache) {
-            throw Error('`env.useCustomCache=true`, but `env.customCache` is not defined.')
-        }
-
-        // Check that the required methods are defined:
-        if (!env.customCache.match || !env.customCache.put) {
-            throw new Error(
-                "`env.customCache` must be an object which implements the `match` and `put` functions of the Web Cache API. " +
-                "For more information, see https://developer.mozilla.org/en-US/docs/Web/API/Cache"
-            )
-        }
-        cache = env.customCache;
-    }
-
     const revision = options.revision ?? 'main';
+    const requestURL = pathJoin(path_or_repo_id, filename);
 
-    let requestURL = pathJoin(path_or_repo_id, filename);
-    let cachePath = pathJoin(env.localModelPath, requestURL);
-
-    let localPath = requestURL;
-    let remoteURL = pathJoin(
+    const validModelId = isValidHfModelId(path_or_repo_id);
+    const localPath = validModelId
+        ? pathJoin(env.localModelPath, requestURL)
+        : requestURL;
+    const remoteURL = pathJoin(
         env.remoteHost,
         env.remotePathTemplate
             .replaceAll('{model}', path_or_repo_id)
@@ -455,14 +479,14 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
         filename
     );
 
-    // Choose cache key for filesystem cache
-    // When using the main revision (default), we use the request URL as the cache key.
-    // If a specific revision is requested, we account for this in the cache key.
-    let fsCacheKey = revision === 'main' ? requestURL : pathJoin(path_or_repo_id, revision, filename);
-
     /** @type {string} */
     let cacheKey;
-    let proposedCacheKey = cache instanceof FileCache ? fsCacheKey : remoteURL;
+    const proposedCacheKey = cache instanceof FileCache
+        // Choose cache key for filesystem cache
+        // When using the main revision (default), we use the request URL as the cache key.
+        // If a specific revision is requested, we account for this in the cache key.
+        ? revision === 'main' ? requestURL : pathJoin(path_or_repo_id, revision, filename)
+        : remoteURL;
 
     // Whether to cache the final response in the end.
     let toCacheResponse = false;
@@ -475,11 +499,10 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
         //  1. We first try to get from cache using the local path. In some environments (like deno),
         //     non-URL cache keys are not allowed. In these cases, `response` will be undefined.
         //  2. If no response is found, we try to get from cache using the remote URL or file system cache.
-        response = await tryCache(cache, cachePath, proposedCacheKey);
+        response = await tryCache(cache, localPath, proposedCacheKey);
     }
 
     const cacheHit = response !== undefined;
-
     if (response === undefined) {
         // Caching not available, or file is not cached, so we perform the request
 
@@ -497,9 +520,9 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
                     console.warn(`Unable to load from local path "${localPath}": "${e}"`);
                 }
             } else if (options.local_files_only) {
-                throw new Error(`\`local_files_only=true\`, but attempted to load a remote file from: ${localPath}.`);
+                throw new Error(`\`local_files_only=true\`, but attempted to load a remote file from: ${requestURL}.`);
             } else if (!env.allowRemoteModels) {
-                throw new Error(`\`env.allowRemoteModels=false\`, but attempted to load a remote file from: ${localPath}.`);
+                throw new Error(`\`env.allowRemoteModels=false\`, but attempted to load a remote file from: ${requestURL}.`);
             }
         }
 
@@ -518,6 +541,11 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
                     // TODO in future, cache the response?
                     return null;
                 }
+            }
+            if (!validModelId) {
+                // Before making any requests to the remote server, we check if the model ID is valid.
+                // This prevents unnecessary network requests for invalid model IDs.
+                throw Error(`Local file missing at "${localPath}" and download aborted due to invalid model ID "${path_or_repo_id}".`);
             }
 
             // File not found locally, so we try to download it from the remote server
@@ -602,7 +630,16 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
     ) {
         if (!result) {
             // We haven't yet read the response body, so we need to do so now.
-            await cache.put(cacheKey, /** @type {Response} */(response), options.progress_callback);
+            // Ensure progress updates include consistent metadata.
+            const wrapped_progress = options.progress_callback
+                ? (data) => dispatchCallback(options.progress_callback, {
+                    status: 'progress',
+                    name: path_or_repo_id,
+                    file: filename,
+                    ...data,
+                })
+                : undefined;
+            await cache.put(cacheKey, /** @type {Response} */(response), wrapped_progress);
         } else {
             // NOTE: We use `new Response(buffer, ...)` instead of `response.clone()` to handle LFS files
             await cache.put(cacheKey, new Response(result, {
@@ -622,7 +659,7 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
     });
 
     if (result) {
-        if (return_path) {
+        if (!apis.IS_NODE_ENV && return_path) {
             throw new Error("Cannot return path in a browser environment.")
         }
         return result;
@@ -631,12 +668,38 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
         return response.filePath;
     }
 
-    const path = await cache.match(cacheKey);
-    if (path instanceof FileResponse) {
-        return path.filePath;
+    // Otherwise, return the cached response (most likely a `FileResponse`).
+    // NOTE: A custom cache may return a Response, or a string (file path)
+    const cachedResponse = await cache?.match(cacheKey);
+    if (cachedResponse instanceof FileResponse) {
+        return cachedResponse.filePath;
+    } else if (cachedResponse instanceof Response) {
+        return new Uint8Array(await cachedResponse.arrayBuffer());
+    } else if (typeof cachedResponse === 'string') {
+        return cachedResponse;
     }
-    throw new Error("Unable to return path for response.");
 
+    throw new Error("Unable to get model file path or buffer.");
+}
+
+/**
+ * Fetches a text file from a given path and file name.
+ *
+ * @param {string} modelPath The path to the directory containing the file.
+ * @param {string} fileName The name of the file to fetch.
+ * @param {boolean} [fatal=true] Whether to throw an error if the file is not found.
+ * @param {PretrainedOptions} [options] An object containing optional parameters.
+ * @returns {Promise<string|null>} The text content of the file.
+ * @throws Will throw an error if the file is not found and `fatal` is true.
+ */
+export async function getModelText(modelPath, fileName, fatal = true, options = {}) {
+    const buffer = await getModelFile(modelPath, fileName, fatal, options, false);
+    if (buffer === null) {
+        return null;
+    }
+
+    const decoder = new TextDecoder('utf-8');
+    return decoder.decode(/** @type {Uint8Array} */(buffer));
 }
 
 /**
@@ -650,16 +713,13 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
  * @throws Will throw an error if the file is not found and `fatal` is true.
  */
 export async function getModelJSON(modelPath, fileName, fatal = true, options = {}) {
-    const buffer = await getModelFile(modelPath, fileName, fatal, options, false);
-    if (buffer === null) {
+    const text = await getModelText(modelPath, fileName, fatal, options);
+    if (text === null) {
         // Return empty object
-        return {}
+        return {};
     }
 
-    const decoder = new TextDecoder('utf-8');
-    const jsonData = decoder.decode(/** @type {Uint8Array} */(buffer));
-
-    return JSON.parse(jsonData);
+    return JSON.parse(text);
 }
 /**
  * Read and track progress when reading a Response object
