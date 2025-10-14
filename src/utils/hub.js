@@ -558,15 +558,16 @@ export async function getModelFile(path_or_repo_id, filename, fatal = true, opti
 
         } else if (
             (
+                // Due to bug in Firefox, we cannot display progress when loading from cache.
+                // Fortunately, since this should be instantaneous, this should not impact users too much.
                 cacheHit // The item is being read from the cache
                 &&
                 typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent) // We are in Firefox
             ) || (
-                typeof response.body === 'undefined' // our fetch polyfill does not have a `body` property on `Response` object
+                // The `body` property may not be available on a `Response` object, e.g., when using a fetch polyfill
+                typeof response.body === 'undefined'
             )
         ) {
-            // Due to bug in Firefox, we cannot display progress when loading from cache.
-            // Fortunately, since this should be instantaneous, this should not impact users too much.
             buffer = new Uint8Array(await response.arrayBuffer());
 
             // For completeness, we still fire the final progress callback
